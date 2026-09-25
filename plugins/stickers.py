@@ -1,186 +1,167 @@
 # -*- coding: utf-8 -*-
 """
-Плагин: Центр управления плагинами (Plugin Store) для Deskify Workspace.
-Масштабное расширение для загрузки, обновления и установки новых модулей прямо из GitHub репозитория.
+Плагин: Стикеры на рабочий стол для Deskify Workspace.
+Позволяет создавать компактные, закрепленные поверх всех окон заметки-стикеры.
 """
 
 import os
-import sys
 import json
-import urllib.request
-import threading
-from tkinter import messagebox
 
 api_workspace = None
+STICKERS_FILE = "data/stickers_plugin.json"
 
-# URL-адрес каталога плагинов на вашем GitHub (в будущем вы можете заменить на свой репозиторий)
-# Для примера используется демонстрационный JSON, описывающий доступные плагины
-MARKETPLACE_URL = "https://githubusercontent.com"
-
-class PluginStoreWindow:
-    def __init__(self):
+class StickerWindow:
+    def __init__(self, text="", x=None, y=None, is_pinned=True, color="#f1c40f"):
         self.ctk = api_workspace["ctk"]
         
-        # Создаем большое полноценное окно магазина
-        self.win = api_workspace["open_window"]("Deskify Plugin Store", 700, 550)
-        self.win.minsize(600, 400)
+        # Создаем окно через стандартный CTkToplevel (не open_window, чтобы убрать рамки)
+        self.win = self.ctk.CTkToplevel()
+        self.win.title("Стикер")
         
-        self.plugins_dir = os.path.dirname(os.path.abspath(__file__))
+        # Настройка размеров и позиции
+        self.win.geometry(f"240x200+{x if x else 400}+{y if y else 300}")
+        self.win.minsize(180, 140)
         
-        self._build_ui()
+        # Свойства окна: убираем стандартную шапку Windows для красоты
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", is_pinned)
         
-        # Загружаем список доступных плагинов в отдельном потоке, чтобы UI не зависал
-        threading.Thread(target=self._fetch_catalog, daemon=True).start()
-
-    def _build_ui(self):
-        # Шапка магазина
-        top_bar = self.ctk.CTkFrame(self.win, fg_color="transparent")
-        top_bar.pack(fill="x", padx=20, pady=(16, 8))
+        self.sticker_color = color
+        self.is_pinned = is_pinned
         
-        self.title_lbl = self.ctk.CTkLabel(
-            top_bar, text="🔌 Магазин расширений Deskify", 
-            font=self.ctk.CTkFont(size=20, weight="bold")
+        # Переменные для реализации перетаскивания окна за любое место
+        self._drag_data = {"x": 0, "y": 0}
+        
+        self._build_ui(text)
+        
+    def _build_ui(self, text):
+        # Главный контейнер стикера с заливкой
+        self.main_frame = self.ctk.CTkFrame(self.win, fg_color=self.sticker_color, corner_radius=10, border_width=1, border_color="gray40")
+        self.main_frame.pack(fill="both", expand=True)
+        
+        # Кастомная мини-панель управления (шапка стикера)
+        self.top_bar = self.ctk.CTkFrame(self.main_frame, fg_color="transparent", height=24)
+        self.top_bar.pack(fill="x", padx=6, pady=2)
+        
+        # Кнопка закрепления поверх окон
+        pin_text = "📌" if self.is_pinned else "📍"
+        self.pin_btn = self.ctk.CTkButton(self.top_bar, text=pin_text, width=20, height=20, fg_color="transparent", text_color="black", hover_color="#00000011", command=self._toggle_pin)
+        self.pin_btn.pack(side="left", padx=2)
+        
+        # Кнопка смены цвета стикера (желтый / зеленый / сиреневый)
+        self.color_btn = self.ctk.CTkButton(self.top_bar, text="🎨", width=20, height=20, fg_color="transparent", text_color="black", hover_color="#00000011", command=self._change_color)
+        self.color_btn.pack(side="left", padx=2)
+        
+        # Кнопка закрытия/удаления
+        self.close_btn = self.ctk.CTkButton(self.top_bar, text="✕", width=20, height=20, fg_color="transparent", text_color="black", hover_color="#c0392b", command=self._close_sticker)
+        self.close_btn.pack(side="right", padx=2)
+        
+        # Текстовое поле для самой заметки
+        self.textbox = self.ctk.CTkTextbox(
+            self.main_frame, 
+            fg_color="transparent", 
+            text_color="black", 
+            font=self.ctk.CTkFont(size=13, family="Courier New", weight="bold"),
+            wrap="word"
         )
-        self.title_lbl.pack(side="left")
+        self.textbox.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.textbox.insert("1.0", text)
         
-        self.status_lbl = self.ctk.CTkLabel(top_bar, text="Подключение к серверу...", text_color="gray60")
-        self.status_lbl.pack(side="right", padx=10)
+        # Привязка событий мыши для свободного перетаскивания окна по экрану
+        self.top_bar.bind("<ButtonPress-1>", self._on_drag_start)
+        self.top_bar.bind("<B1-Motion>", self._on_drag_motion)
+        
+        # Отслеживаем изменения текста для автосохранения
+        self.textbox.bind("<KeyRelease>", lambda e: save_all_stickers())
 
-        # Главный скролл-контейнер для карточек плагинов
-        self.scroll_frame = self.ctk.CTkScrollableFrame(self.win, fg_color="transparent")
-        self.scroll_frame.pack(fill="both", expand=True, padx=20, pady=(4, 16))
+    def _on_drag_start(self, event):
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
 
-    def _fetch_catalog(self):
-        """Безопасное скачивание каталога плагинов из интернета"""
+    def _on_drag_motion(self, event):
+        deltax = event.x - self._drag_data["x"]
+        deltay = event.y - self._drag_data["y"]
+        x = self.win.winfo_x() + deltax
+        y = self.win.winfo_y() + deltay
+        self.win.geometry(f"+{x}+{y}")
+        save_all_stickers()
+
+    def _toggle_pin(self):
+        self.is_pinned = not self.is_pinned
+        self.win.attributes("-topmost", self.is_pinned)
+        self.pin_btn.configure(text="📌" if self.is_pinned else "📍")
+        save_all_stickers()
+
+    def _change_color(self):
+        colors = ["#f1c40f", "#2ecc71", "#9b59b6", "#e74c3c", "#3498db"] # Желтый, зеленый, фиолетовый, красный, синий
         try:
-            # Имитируем каталог, если сеть недоступна или репозиторий еще не создан
-            # В продакшене этот JSON будет отдавать ваш GitHub
-            try:
-                with urllib.request.urlopen(MARKETPLACE_URL, timeout=5) as response:
-                    catalog = json.loads(response.read().decode('utf-8'))
-            except Exception:
-                # Запасной демонстрационный каталог (Mock-данные для демонстрации работы)
-                catalog = [
-                    {
-                        "id": "engineering_calculator.py",
-                        "name": "📐 Инженерный калькулятор",
-                        "desc": "Расширенные математические функции: тригонометрия (sin, cos), логарифмы, корни и константы пи/е.",
-                        "url": "https://githubusercontent.com"
-                    },
-                    {
-                        "id": "desktop_stickers.py",
-                        "name": "📌 Стикеры на рабочий стол",
-                        "desc": "Создание миниатюрных полупрозрачных заметок-листочков, закрепляемых поверх всех окон системы.",
-                        "url": "https://githubusercontent.com"
-                    },
-                    {
-                        "id": "habit_tracker.py",
-                        "name": "📈 Трекер привычек",
-                        "desc": "Позволяет внедрять полезные ритуалы, контролировать их выполнение и копить серии огненных дней.",
-                        "url": "https://githubusercontent.com"
-                    }
-                ]
+            current_idx = colors.index(self.sticker_color)
+            next_idx = (current_idx + 1) % len(colors)
+        except ValueError:
+            next_idx = 0
+            
+        self.sticker_color = colors[next_idx]
+        self.main_frame.configure(fg_color=self.sticker_color)
+        save_all_stickers()
 
-            self.win.after(0, lambda: self._render_catalog(catalog))
-        except Exception as e:
-            self.win.after(0, lambda: self._set_status(f"Ошибка сети: {str(e)}", "error"))
+    def _close_sticker(self):
+        self.win.destroy()
+        if self in active_stickers:
+            active_stickers.remove(self)
+        save_all_stickers()
 
-    def _set_status(self, text, mode="info"):
-        color = "#e74c3c" if mode == "error" else "gray60"
-        self.status_lbl.configure(text=text, text_color=color)
 
-    def _render_catalog(self, catalog):
-        self._set_status("Каталог успешно обновлен")
-        
-        # Очищаем контейнер
-        for w in self.scroll_frame.winfo_children():
-            w.destroy()
+active_stickers = []
 
-        for p in catalog:
-            # Проверяем, установлен ли уже этот плагин локально
-            file_path = os.path.join(self.plugins_dir, p["id"])
-            is_installed = os.path.exists(file_path)
+def create_new_sticker(text="", x=None, y=None, is_pinned=True, color="#f1c40f"):
+    sticker = StickerWindow(text, x, y, is_pinned, color)
+    active_stickers.append(sticker)
+    save_all_stickers()
 
-            # Карточка плагина
-            card = self.ctk.CTkFrame(self.scroll_frame, corner_radius=8)
-            card.pack(fill="x", pady=6, padx=4)
+def save_all_stickers():
+    """Сохраняет состояние всех открытых стикеров в JSON файл"""
+    data = []
+    for s in active_stickers:
+        if s.win.winfo_exists():
+            data.append({
+                "text": s.textbox.get("1.0", "end-1c"),
+                "x": s.win.winfo_x(),
+                "y": s.win.winfo_y(),
+                "is_pinned": s.is_pinned,
+                "color": s.sticker_color
+            })
+    try:
+        with open(STICKERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-            # Текстовый блок внутри карточки
-            info_frame = self.ctk.CTkFrame(card, fg_color="transparent")
-            info_frame.pack(side="left", fill="both", expand=True, padx=12, pady=12)
-
-            ctk.CTkLabel(info_frame, text=p["name"], font=self.ctk.CTkFont(size=15, weight="bold")).pack(anchor="w")
-            ctk.CTkLabel(info_frame, text=p["desc"], text_color="gray60", font=self.ctk.CTkFont(size=12), wrap_length=420, justify="left").pack(anchor="w", pady=(4, 0))
-
-            # Кнопка управления (Установить / Удалить)
-            btn_frame = self.ctk.CTkFrame(card, fg_color="transparent")
-            btn_frame.pack(side="right", padx=16, pady=12)
-
-            if is_installed:
-                btn = self.ctk.CTkButton(
-                    btn_frame, text="Удалить", fg_color="#c0392b", hover_color="#e74c3c", width=100,
-                    command=lambda p_id=p["id"]: self._delete_plugin(p_id)
+def load_stickers_history():
+    """Загружает стикеры, которые были открыты при прошлом запуске программы"""
+    if not os.path.exists(STICKERS_FILE):
+        return
+    try:
+        with open(STICKERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for item in data:
+                create_new_sticker(
+                    text=item.get("text", ""),
+                    x=item.get("x"),
+                    y=item.get("y"),
+                    is_pinned=item.get("is_pinned", True),
+                    color=item.get("color", "#f1c40f")
                 )
-            else:
-                btn = self.ctk.CTkButton(
-                    btn_frame, text="Установить", fg_color="#1f538d", hover_color="#1c497d", width=100,
-                    command=lambda p_url=p["url"], p_id=p["id"]: self._install_plugin(p_url, p_id)
-                )
-            btn.pack()
+    except Exception:
+        pass
 
-    def _install_plugin(self, url, filename):
-        self._set_status("Загрузка...")
-        
-        def worker():
-            try:
-                target_path = os.path.join(self.plugins_dir, filename)
-                
-                # Скачиваем файл плагина из репозитория
-                with urllib.request.urlopen(url, timeout=10) as response:
-                    code = response.read()
-                    with open(target_path, "wb") as f:
-                        f.write(code)
-                        
-                self.win.after(0, self._prompt_restart)
-            except Exception as e:
-                self.win.after(0, lambda: messagebox.showerror("Ошибка установки", f"Не удалось скачать плагин:\n{e}"))
-                self.win.after(0, lambda: self._set_status("Ошибка установки", "error"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _delete_plugin(self, filename):
-        if messagebox.askyesno("Удаление", f"Вы уверены, что хотите удалить {filename}?"):
-            try:
-                target_path = os.path.join(self.plugins_dir, filename)
-                if os.path.exists(target_path):
-                    os.remove(target_path)
-                self._prompt_restart()
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось удалить файл: {e}")
-
-    def _prompt_restart(self):
-        """Информирует об успешном действии и предлагает перезапустить Deskify"""
-        if messagebox.askyesno("Перезапуск системы", "Действие выполнено успешно!\n\nДля применения изменений необходимо перезапустить Deskify Workspace. Перезапустить сейчас?"):
-            self._restart_app()
-        else:
-            # Просто обновляем интерфейс магазина, если пользователь отказался перезапускаться прямо сейчас
-            threading.Thread(target=self._fetch_catalog, daemon=True).start()
-
-    def _restart_app(self):
-        """Горячий перезапуск всего приложения Deskify Workspace"""
-        try:
-            python = sys.executable
-            os.execv(python, [python] + sys.argv)
-        except Exception as e:
-            messagebox.showerror("Ошибка перезапуска", f"Не удалось автоматически перезагрузить приложение: {e}")
-
-
-def open_store():
-    PluginStoreWindow()
 
 def register(api):
     global api_workspace
     api_workspace = api
     
-    # Интегрируем кнопку маркетплейса в сайдбар Deskify Workspace
-    api["add_button"]("🌐 Магазин плагинов", open_store)
+    # Регистрируем кнопку в главном меню Deskify
+    api["add_button"]("📌 Создать стикер", lambda: create_new_sticker("Новая заметка..."))
+    
+    # Автоматически восстанавливаем старые стикеры при загрузке плагина
+    # Используем after(100), чтобы дождаться полной инициализации главного окна программы
+    api_workspace["ctk"].CTkFrame(api_workspace["ctk"]()).after(100, load_stickers_history)
