@@ -1,0 +1,10 @@
+{
+  "version": "1.2.0",
+  "release_notes": [
+    "Исправлен серьёзный баг с магазином плагинов",
+    "Добавлено окно со всеми плагинами",
+    "Добавлена возможность отключать компоненты"
+  ],
+  "github_url": "https://github.com/deskify/Workspace",
+  "releases_url": "https://github.com/deskify/Workspace/releases"
+}
